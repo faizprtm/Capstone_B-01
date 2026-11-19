@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-gps_reader.py — Thread NMEA reader, expose ego_speed_ms (kecepatan kendaraan kita).
+gps_reader.py — Threaded GPS NMEA reader with a 1D Kalman Filter.
 
-Diambil dari sensor_test/gps/test_baru.py dan direfactor menjadi class
-yang berjalan di background thread, aman untuk dibaca dari thread lain.
+Kompatibel dengan interface GPSReader yang digunakan oleh adas/pipeline.py:
+    GPSReader()
+    start()
+    stop()
+    ego_speed_ms
+    gps_status
+    is_valid
 
-Hardware:
-    GPS via UART0: RX→PH0, TX→PH1, /dev/ttyS0, 9600 baud, NMEA 0183.
+Data tambahan untuk evaluasi:
+    raw_speed_ms
+    kalman_gain
 
-Sentence yang dipakai:
-    $GNRMC — Global Navigation Recommended Minimum Specific GNSS Data.
-    Field 7 (speed over ground, knots) dikonversi ke m/s.
-
-Fallback:
-    Jika GPS belum fix atau serial error, ego_speed_ms mengembalikan 0.0.
-    Pipeline menggunakan ini sebagai fallback graceful (tidak crash).
+Catatan:
+    ego_speed_ms bernilai 0.0 ketika GPS tidak valid untuk kompatibilitas.
+    Nilai tersebut BUKAN bukti kendaraan sedang berhenti. Pipeline wajib
+    memeriksa is_valid sebelum menggunakan kecepatan untuk perhitungan TTC.
 """
 
 from __future__ import annotations
 
-import threading
 import logging
+import math
+import threading
 import time
 from typing import Optional
 
@@ -30,26 +34,89 @@ from .constants import GPS_PORT, GPS_BAUD, GPS_STALE_TIMEOUT_S
 
 log = logging.getLogger(__name__)
 
-# Konversi knot ke m/s
 KNOTS_TO_MS = 0.5144444
+
+# Parameter awal untuk pengujian, belum merupakan hasil kalibrasi bus.
+# P0 dan R berdimensi (m/s)^2; Q berdimensi (m/s)^2 per detik.
+KALMAN_INITIAL_P = 1.0
+KALMAN_Q = 0.5
+KALMAN_R = 2.0
+
+
+class KalmanSpeedFilter:
+    """Kalman Filter 1D untuk estimasi kecepatan GPS (m/s)."""
+
+    def __init__(
+        self,
+        p0: float = KALMAN_INITIAL_P,
+        q: float = KALMAN_Q,
+        r: float = KALMAN_R,
+    ) -> None:
+        if not all(math.isfinite(v) for v in (p0, q, r)):
+            raise ValueError("Kalman parameters must be finite")
+        if p0 <= 0.0 or q < 0.0 or r <= 0.0:
+            raise ValueError("Require p0 > 0, q >= 0, and r > 0")
+
+        self.p0 = float(p0)
+        self.q = float(q)
+        self.r = float(r)
+
+        self.x: Optional[float] = None
+        self.p = self.p0
+        self.last_time: Optional[float] = None
+        self.gain = 0.0
+
+    def update(self, measurement: float, now: float) -> float:
+        """Masukkan pengukuran baru dan kembalikan estimasi kecepatan."""
+
+        if not math.isfinite(measurement) or measurement < 0.0:
+            raise ValueError("GPS speed must be finite and non-negative")
+
+        if not math.isfinite(now):
+            raise ValueError("Timestamp must be finite")
+
+        # Pengukuran valid pertama menjadi inisialisasi state.
+        if self.x is None or self.last_time is None:
+            self.x = float(measurement)
+            self.p = self.p0
+            self.last_time = now
+            self.gain = 0.0
+            return self.x
+
+        dt = max(0.0, now - self.last_time)
+        self.last_time = now
+
+        # Prediction: model kecepatan konstan dengan ketidakpastian proses.
+        x_pred = self.x
+        p_pred = self.p + self.q * dt
+
+        # Correction.
+        gain = p_pred / (p_pred + self.r)
+        self.x = x_pred + gain * (measurement - x_pred)
+        self.p = max(0.0, (1.0 - gain) * p_pred)
+        self.gain = gain
+
+        return max(0.0, self.x)
+
+    def reset(self) -> None:
+        """Hapus state lama agar sesi fix baru tidak mewarisi estimasi lama."""
+        self.x = None
+        self.p = self.p0
+        self.last_time = None
+        self.gain = 0.0
 
 
 class GPSReader:
     """
-    Membaca kecepatan ego dari modul GPS NMEA 0183 secara non-blocking.
+    Membaca sentence $GNRMC/$GPRMC pada background thread.
 
-    Status GPS yang di-expose ke pipeline:
-        'OK'     — fix valid, nilai fresh (< GPS_STALE_TIMEOUT_S)
-        'STALE'  — fix valid tapi nilai tidak berubah terlalu lama (stuck/drift)
-        'NOFIX'  — NMEA status = 'V' (void), belum dapat sinyal
-        'ERROR'  — serial error / port tidak tersedia
+    Status:
+        OK     : fix valid dan data lebih baru dari GPS_STALE_TIMEOUT_S
+        STALE  : fix terakhir valid, tetapi tidak ada pembaruan tepat waktu
+        NOFIX  : sentence RMC menyatakan status V atau belum memperoleh fix
+        ERROR  : port serial tidak tersedia / terjadi serial error
 
-    Cara pakai:
-        gps = GPSReader()
-        gps.start()
-        speed  = gps.ego_speed_ms   # thread-safe
-        status = gps.gps_status     # 'OK'|'STALE'|'NOFIX'|'ERROR'
-        valid  = gps.is_valid       # True hanya saat 'OK'
+    Properti publik aman dibaca dari thread lain.
     """
 
     def __init__(
@@ -57,57 +124,93 @@ class GPSReader:
         port: str = GPS_PORT,
         baud: int = GPS_BAUD,
     ) -> None:
-        self._port  = port
-        self._baud  = baud
+        self._port = port
+        self._baud = baud
 
-        self._speed_ms     : float = 0.0
-        self._last_update  : float = 0.0   # monotonic time saat terakhir terima nilai valid
-        self._last_speed   : float = -1.0  # untuk deteksi stuck (nilai tidak berubah)
-        self._nmea_fix     : str   = 'V'   # 'A' atau 'V' dari GNRMC
-        self._serial_ok    : bool  = False
+        self._speed_ms: float = 0.0
+        self._raw_speed_ms: float = 0.0
+        self._last_update: float = 0.0
 
-        self._lock    = threading.Lock()
+        self._nmea_fix: str = "V"
+        self._serial_ok: bool = False
+
+        self._kalman = KalmanSpeedFilter()
+
+        self._lock = threading.Lock()
         self._stop_ev = threading.Event()
-        self._thread  : Optional[threading.Thread] = None
+        self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
-    # Properti publik — semua thread-safe
+    # Internal state / validity
     # ------------------------------------------------------------------
+
+    def _is_valid_locked(self) -> bool:
+        if not self._serial_ok or self._nmea_fix != "A":
+            return False
+        if self._last_update <= 0.0:
+            return False
+        return (time.monotonic() - self._last_update) <= GPS_STALE_TIMEOUT_S
+
+    def _reset_measurement_locked(self, fix: str = "V") -> None:
+        self._nmea_fix = fix
+        self._last_update = 0.0
+        self._speed_ms = 0.0
+        self._raw_speed_ms = 0.0
+        self._kalman.reset()
+
+    # ------------------------------------------------------------------
+    # Public properties — preserve the old pipeline interface
+    # ------------------------------------------------------------------
+
     @property
     def ego_speed_ms(self) -> float:
-        """Kecepatan ego (m/s). Selalu 0.0 jika GPS tidak valid."""
+        """Kecepatan hasil Kalman (m/s), atau 0.0 jika GPS tidak valid."""
         with self._lock:
-            return self._speed_ms
+            return self._speed_ms if self._is_valid_locked() else 0.0
+
+    @property
+    def raw_speed_ms(self) -> float:
+        """Kecepatan GPS sebelum filtering (m/s), atau 0.0 jika invalid."""
+        with self._lock:
+            return self._raw_speed_ms if self._is_valid_locked() else 0.0
+
+    @property
+    def kalman_gain(self) -> float:
+        """Gain terakhir; 0.0 setelah filter diinisialisasi ulang."""
+        with self._lock:
+            return self._kalman.gain
 
     @property
     def gps_status(self) -> str:
-        """
-        Status kualitas GPS:
-            'OK'    — fix valid + nilai fresh
-            'STALE' — fix valid tapi stuck (tidak update > GPS_STALE_TIMEOUT_S)
-            'NOFIX' — NMEA void / belum lock
-            'ERROR' — serial tidak tersedia
-        """
         with self._lock:
             if not self._serial_ok:
-                return 'ERROR'
-            if self._nmea_fix != 'A':
-                return 'NOFIX'
-            age = time.monotonic() - self._last_update
-            if age > GPS_STALE_TIMEOUT_S:
-                return 'STALE'
-            return 'OK'
+                return "ERROR"
+            if self._nmea_fix != "A":
+                return "NOFIX"
+            if self._last_update <= 0.0:
+                return "NOFIX"
+            if (time.monotonic() - self._last_update) > GPS_STALE_TIMEOUT_S:
+                return "STALE"
+            return "OK"
 
     @property
     def is_valid(self) -> bool:
-        """True hanya jika GPS status == 'OK' (fix + fresh)."""
-        return self.gps_status == 'OK'
+        with self._lock:
+            return self._is_valid_locked()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
     def start(self) -> None:
-        """Mulai thread pembaca GPS di background."""
+        """Mulai thread pembaca; pemanggilan berulang tidak membuat thread ganda."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        with self._lock:
+            self._serial_ok = False
+            self._reset_measurement_locked("V")
+
         self._stop_ev.clear()
         self._thread = threading.Thread(
             target=self._reader_loop,
@@ -115,107 +218,148 @@ class GPSReader:
             daemon=True,
         )
         self._thread.start()
-        log.info("[GPS] Thread dimulai (%s @ %d baud)", self._port, self._baud)
+        log.info("[GPS] Thread started (%s @ %d baud)", self._port, self._baud)
 
     def stop(self) -> None:
-        """Hentikan thread GPS dengan graceful."""
+        """Hentikan thread dan tunggu pembacaan serial selesai."""
         self._stop_ev.set()
         if self._thread is not None:
             self._thread.join(timeout=3.0)
-        log.info("[GPS] Thread dihentikan.")
+            if self._thread.is_alive():
+                log.warning("[GPS] Reader thread belum berhenti setelah timeout")
+        log.info("[GPS] Thread stopped")
 
     # ------------------------------------------------------------------
-    # Loop thread
+    # NMEA checksum
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _checksum_valid(line: str) -> bool:
+        # Beberapa perangkat/stream dapat mengirim sentence tanpa checksum.
+        # Jika checksum tersedia, checksum wajib cocok.
+        if "*" not in line:
+            return True
+
+        try:
+            sentence, received = line[1:].rsplit("*", 1)
+            calculated = 0
+            for char in sentence:
+                calculated ^= ord(char)
+            return f"{calculated:02X}" == received.strip().upper()
+        except (ValueError, IndexError):
+            return False
+
+    # ------------------------------------------------------------------
+    # Reader thread
+    # ------------------------------------------------------------------
+
     def _reader_loop(self) -> None:
         while not self._stop_ev.is_set():
+            ser = None
             try:
                 ser = serial.Serial(
-                    port     = self._port,
-                    baudrate = self._baud,
-                    timeout  = 2.0,
-                    bytesize = serial.EIGHTBITS,
-                    parity   = serial.PARITY_NONE,
-                    stopbits = serial.STOPBITS_ONE,
+                    port=self._port,
+                    baudrate=self._baud,
+                    timeout=1.0,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
                 )
                 ser.reset_input_buffer()
+
                 with self._lock:
                     self._serial_ok = True
-                log.info("[GPS] Serial port terbuka: %s", self._port)
+                    self._reset_measurement_locked("V")
+
+                log.info("[GPS] Serial port opened: %s", self._port)
 
                 while not self._stop_ev.is_set():
                     raw = ser.readline()
                     if not raw:
+                        # gps_status akan berubah menjadi STALE melalui timeout
+                        # tanpa perlu menganggap timeout pembacaan sebagai 0 m/s.
                         continue
 
-                    try:
-                        line = raw.decode("utf-8", errors="ignore").strip()
-                    except Exception:
-                        continue
-
+                    line = raw.decode("ascii", errors="ignore").strip()
                     if not line.startswith("$"):
                         continue
+                    if not self._checksum_valid(line):
+                        log.debug("[GPS] NMEA checksum mismatch; sentence skipped")
+                        continue
 
-                    # Validasi checksum NMEA
-                    if "*" in line:
-                        try:
-                            sentence, chk = line[1:].rsplit("*", 1)
-                            calc = 0
-                            for ch in sentence:
-                                calc ^= ord(ch)
-                            if f"{calc:02X}" != chk.upper().strip():
-                                continue
-                        except Exception:
-                            continue
-
-                    if line.startswith(("$GNRMC", "$GPRMC")):
+                    if line.startswith(("$GNRMC,", "$GPRMC,")):
                         self._parse_rmc(line)
 
-                ser.close()
+            except serial.SerialException as exc:
+                if not self._stop_ev.is_set():
+                    log.warning("[GPS] Serial error: %s", exc)
+            except Exception:
+                if not self._stop_ev.is_set():
+                    log.exception("[GPS] Unexpected reader error")
+            finally:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
 
-            except serial.SerialException as e:
                 with self._lock:
                     self._serial_ok = False
-                log.warning("[GPS] Serial error: %s — retry dalam 5 s", e)
-                time.sleep(5.0)
-            except Exception as e:
-                with self._lock:
-                    self._serial_ok = False
-                log.error("[GPS] Error tak terduga: %s", e)
-                time.sleep(5.0)
+                    self._reset_measurement_locked("V")
+
+                if not self._stop_ev.is_set():
+                    self._stop_ev.wait(5.0)
+
+    # ------------------------------------------------------------------
+    # RMC parser + Kalman
+    # ------------------------------------------------------------------
 
     def _parse_rmc(self, sentence: str) -> None:
-        """
-        Parse $GNRMC/$GPRMC.
-        Validity check  : field status == 'A'
-        Staleness check : catat waktu monotonic tiap kali nilai fix diterima;
-                          gps_status property cek age vs GPS_STALE_TIMEOUT_S
-        """
         parts = sentence.split(",")
         if len(parts) < 8:
             return
 
-        nmea_fix = parts[2]   # 'A' = valid, 'V' = void
+        fix_status = parts[2].strip().upper()
 
-        with self._lock:
-            self._nmea_fix = nmea_fix
-
-        if nmea_fix != "A":
-            # No fix — tidak update speed
+        if fix_status != "A":
+            with self._lock:
+                self._reset_measurement_locked("V")
             return
 
+        # Field 7 adalah speed over ground dalam knots.
+        # Field kosong/tidak numerik tidak diperlakukan sebagai 0 m/s,
+        # karena itu bukan pengukuran kecepatan yang sah.
         try:
-            speed_knots = float(parts[7]) if parts[7] else 0.0
-            speed_ms    = round(speed_knots * KNOTS_TO_MS, 3)
-        except ValueError:
+            if not parts[7].strip():
+                return
+            speed_knots = float(parts[7])
+            speed_raw_ms = speed_knots * KNOTS_TO_MS
+            if not math.isfinite(speed_raw_ms) or speed_raw_ms < 0.0:
+                return
+        except (ValueError, TypeError):
             return
 
         now = time.monotonic()
+
         with self._lock:
-            self._speed_ms    = speed_ms
+            # Jika data sebelumnya sudah melewati stale timeout, jangan
+            # menggabungkan sesi pengukuran baru dengan state filter lama.
+            if (
+                self._last_update > 0.0
+                and (now - self._last_update) > GPS_STALE_TIMEOUT_S
+            ):
+                self._kalman.reset()
+
+            filtered_ms = self._kalman.update(speed_raw_ms, now)
+
+            self._raw_speed_ms = round(speed_raw_ms, 3)
+            self._speed_ms = round(filtered_ms, 3)
             self._last_update = now
-            # Deteksi stuck: jika nilai persis sama dengan sebelumnya,
-            # TIDAK perbarui _last_update sehingga staleness timer tetap berjalan
-            # (override: tetap update karena speed bisa memang konstan saat cruise)
-            # Staleness murni berbasis waktu, bukan perubahan nilai.
-            self._last_speed  = speed_ms
+            self._nmea_fix = "A"
+
+            log.debug(
+                "[GPS] raw=%.3f m/s | filtered=%.3f m/s | gain=%.3f",
+                self._raw_speed_ms,
+                self._speed_ms,
+                self._kalman.gain,
+            )
